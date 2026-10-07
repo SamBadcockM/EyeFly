@@ -264,3 +264,26 @@ test("genuinely empty stretches are reported, not silently dropped", async () =>
     WORLD.push(...hidden);
   }
 });
+
+test("a heavy category that always times out cannot wipe out the cheap categories", async () => {
+  const queries = [];
+  const base = vercelFetch({ maxWidthDeg: 3 }, []);
+  const fetch = async (url, options) => {
+    if (!url.startsWith("/api/") && !url.includes("wikidata") && /^data=/.test(options.body)) {
+      const q = decodeURIComponent(options.body.replace(/^data=/, "").replace(/\+/g, " "));
+      queries.push(q);
+      if (/"natural"="water"/.test(q)) {
+        return { ok: true, status: 200, json: async () => ({ elements: [], remark: "runtime error: Query timed out" }) };
+      }
+    }
+    return base(url, options);
+  };
+  const rb = loadRouteBuilder(fetch);
+  const { ExcelJS } = mockExcelJS();
+  const r = await rb.buildRoute(ROUTE, ExcelJS, { from: "AAA", to: "BBB", corridorKm: 50, maxPer5km: 3, enrich: false, categories: ["Landmark", "Lake"] });
+  assert.equal(r.gaps.length, 0, "whole route still covered by the cheap categories");
+  assert.ok(maxGap(r.pois, r.distance_km) <= 100);
+  assert.ok(r.heavy_skipped > 0, "heavy category failure is reported");
+  assert.ok(queries.filter((q) => /"tourism"="attraction"/.test(q)).every((q) => !/"natural"="water"/.test(q)),
+    "heavy selectors are never mixed into the cheap queries");
+});

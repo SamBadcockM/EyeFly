@@ -296,7 +296,15 @@ const OUTAGE_FAILS = 3;        // this many failures with zero successes = OSM i
 const MAX_GAP_KM = 100;        // any stretch of route longer than this with no POI gets a gap-filling search
 const MAX_WIDEN_KM = 150;      // gap-filling never searches wider than this each side
 const WIKIDATA_BATCH = 20;     // sample points per Wikidata request (server accepts up to 100)
-const osm = { ok: 0, fail: 0 }; // success/failure counters for the current build (reset in fetchPois)
+/* Categories whose OSM tags are so common that scanning them over a big box in lowland Europe times out
+   (millions of lakes / woods / river ways). They are searched separately, after the cheap categories,
+   inside a time budget, so one of them timing out can never wipe out cities, mountains and landmarks. */
+const HEAVY_CATEGORIES = new Set(["Forest", "Lake", "River", "Wetland & Delta", "Cliff & Ridge", "Canyon & Valley",
+  "Bridge", "Beach", "Mine & Quarry", "Port & Harbour", "Sea & Coast", "Dam"]);
+const HEAVY_BUDGET_MS = 150000;  // total time the heavy categories may use
+const HEAVY_CHUNK_KM = 80;       // heavy categories use short boxes
+const HEAVY_MAX_SPLITS = 1;
+const osm = { ok: 0, fail: 0, lastError: "" }; // success/failure counters for the current build (reset in fetchPois)
 
 const queryCache = new Map();
 let proxyAvailable = typeof location !== "undefined" && location.protocol.startsWith("http");
@@ -602,21 +610,25 @@ function splitBbox([s, w, n, e]) {
 /* Fetch one box; if it fails (timeout / busy / "all mirrors failed"), retry it as smaller boxes instead
    of losing that stretch of the route. The only time we stop splitting is when OSM looks completely down
    (several failures and not one success), so a real outage doesn't turn into hours of retries. */
-async function fetchBox(bbox, cats, depth = 0, includeUnlinked = false) {
+async function fetchBox(bbox, cats, depth = 0, includeUnlinked = false, limits = {}) {
+  if (limits.deadline && Date.now() > limits.deadline) {
+    return { elements: [], failed: 1, error: "time budget used" };
+  }
   try {
     const data = await overpass(buildQuery(bbox, cats, includeUnlinked));
     osm.ok++;
     return { elements: data.elements || [], failed: 0, error: "" };
   } catch (e) {
+    osm.lastError = e.message;
     const tooLarge = /query too large/i.test(e.message);
     if (!tooLarge) osm.fail++;   // a too-large box is not an outage: it just needs splitting
     const outage = osm.ok === 0 && osm.fail >= OUTAGE_FAILS;
-    if (depth >= MAX_SPLITS || outage) {
+    if (depth >= (limits.maxSplits ?? MAX_SPLITS) || outage) {
       return { elements: [], failed: 1, error: e.message };
     }
     const out = { elements: [], failed: 0, error: "" };
     for (const part of splitBbox(bbox)) {
-      const r = await fetchBox(part, cats, depth + 1, includeUnlinked);
+      const r = await fetchBox(part, cats, depth + 1, includeUnlinked, limits);
       out.elements.push(...r.elements);
       out.failed += r.failed;
       out.error = r.error || out.error;
@@ -717,11 +729,16 @@ async function fetchPois(path, cum, categories, opt = {}) {
   const cats = categories.filter(c => CATEGORIES[c]);
   if (!cats.length) return [];
 
-  osm.ok = 0; osm.fail = 0;
+  osm.ok = 0; osm.fail = 0; osm.lastError = "";
   const last = path.length - 1;
   const totalKm = cum[last] || 0;
-  const hasArea = cats.some(c => CATEGORIES[c].area);
-  const areaMul = hasArea ? 2 : 1;
+  // cheap categories first (they cover the whole route reliably); heavy ones afterwards on a time budget
+  let lightCats = cats.filter(c => !HEAVY_CATEGORIES.has(c));
+  let heavyCats = cats.filter(c => HEAVY_CATEGORIES.has(c));
+  if (!lightCats.length) { lightCats = cats; heavyCats = []; }
+  const areaOf = list => (list.some(c => CATEGORIES[c].area) ? 2 : 1);
+  const areaMul = areaOf(lightCats);
+  let heavySkipped = 0;
   const found = new Map();           // "type/id" -> { el, lo, hi, corridorKm }
   let lastError = "";
 
@@ -736,13 +753,13 @@ async function fetchPois(path, cum, categories, opt = {}) {
   };
 
   /* Run OSM over the given path-index ranges. Returns the ranges where something still failed. */
-  const searchOsm = async (ranges, includeUnlinked, corridor, label, p0, p1, chunkKm = CHUNK_KM) => {
-    const chunks = ranges.flatMap(([a, b]) => corridorChunks(path, cum, corridor * areaMul, a, b, chunkKm));
+  const searchOsm = async (ranges, includeUnlinked, corridor, label, p0, p1, chunkKm = CHUNK_KM, catList = lightCats, limits = {}) => {
+    const chunks = ranges.flatMap(([a, b]) => corridorChunks(path, cum, corridor * areaOf(catList), a, b, chunkKm));
     const failedRanges = [];
     let done = 0;
     progress(p0, `${label} (0/${chunks.length} segments)`);
     await mapPool(chunks, CONCURRENCY, async chunk => {
-      const res = await fetchBox(chunk.bbox, cats, 0, includeUnlinked);
+      const res = await fetchBox(chunk.bbox, catList, 0, includeUnlinked, limits);
       if (res.failed) { failedRanges.push([chunk.start, chunk.end]); lastError = res.error || lastError; }
       for (const el of res.elements) addFound(el, chunk.lo, chunk.hi, corridor);
       done++;
@@ -804,20 +821,20 @@ async function fetchPois(path, cum, categories, opt = {}) {
   };
 
   // ---- pass 1: strict OSM search over the whole route
-  let failed = await searchOsm([[0, last]], false, corridorKm, "Fetching POIs from OpenStreetMap", 0.02, 0.40);
+  let failed = await searchOsm([[0, last]], false, corridorKm, "Fetching POIs from OpenStreetMap", 0.02, 0.30);
 
   // ---- pass 2: re-run failed segments as short pieces after a cool-down
   const osmDown = () => osm.ok === 0 && osm.fail >= OUTAGE_FAILS;
   if (failed.length && !osmDown()) {
-    progress(0.40, `Retrying ${failed.length} busy stretch(es) in smaller pieces`);
+    progress(0.30, `Retrying ${failed.length} busy stretch(es) in smaller pieces`);
     await sleep(RETRY_PAUSE_MS);
-    failed = await searchOsm(failed, false, corridorKm, "Retrying busy stretches", 0.40, 0.55, RETRY_CHUNK_KM);
+    failed = await searchOsm(failed, false, corridorKm, "Retrying busy stretches", 0.30, 0.42, RETRY_CHUNK_KM);
   }
 
   // ---- pass 3: stretches OSM could not deliver at all -> Wikidata, only for those stretches
   let wikidataError = "";
   const searchWikidata = async ranges => {
-    const radiusKm = Math.max(10, Math.min(100, corridorKm * areaMul));
+    const radiusKm = Math.max(10, Math.min(100, corridorKm * areaOf(cats)));
     const stillFailed = [];
     for (const [a, b] of ranges) {
       const centers = sampleWikidataCenters(path, cum, radiusKm, a, b);
@@ -835,24 +852,32 @@ async function fetchPois(path, cum, categories, opt = {}) {
   };
   if (failed.length) failed = await searchWikidata(failed);
 
+  // ---- heavy categories (lakes, forests, rivers, ...): own queries, short boxes, strict time budget
+  if (heavyCats.length && !osmDown()) {
+    const deadline = Date.now() + HEAVY_BUDGET_MS;
+    const heavyFailed = await searchOsm([[0, last]], false, corridorKm, "Fetching lakes, forests, rivers and other heavy map layers",
+      0.50, 0.70, HEAVY_CHUNK_KM, heavyCats, { maxSplits: HEAVY_MAX_SPLITS, deadline });
+    heavySkipped = heavyFailed.length;
+  }
+
   // ---- passes 4 + 5: stretches that came back empty
-  const canRelax = cats.some(c => CATEGORIES[c].sel.some(sel => sel.includes('["wikidata"]')));
+  const canRelax = lightCats.some(c => CATEGORIES[c].sel.some(sel => sel.includes('["wikidata"]')));
   let candidates = toCandidates();
   if (canRelax && !osmDown()) {
     // Whole-route empty used to be the only trigger; with gap-filling on, any >100 km blank stretch triggers it.
     let gaps = fillGaps ? emptyRanges(failed) : (candidates.length ? [] : (failed.length ? [] : [[0, last]]));
     if (gaps.length) {
-      progress(0.60, candidates.length ? "Filling empty stretches: retrying without the Wikidata-tag requirement"
+      progress(0.72, candidates.length ? "Filling empty stretches: retrying without the Wikidata-tag requirement"
                                        : "No named POIs with Wikidata tags found; retrying without that requirement");
-      await searchOsm(gaps, true, corridorKm, "Searching for all named POIs in empty stretches", 0.60, 0.78);
+      await searchOsm(gaps, true, corridorKm, "Searching for all named POIs in empty stretches", 0.72, 0.84);
       candidates = toCandidates();
     }
     const widened = Math.min(MAX_WIDEN_KM, corridorKm * 2);
     if (fillGaps && widened > corridorKm && !osmDown()) {
       gaps = emptyRanges(failed);
       if (gaps.length) {
-        progress(0.80, `Still empty: widening the search to ${widened} km each side`);
-        await searchOsm(gaps, true, widened, `Searching ${widened} km each side of empty stretches`, 0.80, 0.93);
+        progress(0.86, `Still empty: widening the search to ${widened} km each side`);
+        await searchOsm(gaps, true, widened, `Searching ${widened} km each side of empty stretches`, 0.86, 0.95);
         candidates = toCandidates();
       }
     }
@@ -869,6 +894,8 @@ async function fetchPois(path, cum, categories, opt = {}) {
   const hasOsm = kept.some(p => !p.sourceRef.startsWith("Wikidata:"));
   kept.candidateCount = candidates.length;
   kept.skippedSegments = failed.length;
+  kept.heavySkipped = heavySkipped;
+  kept.diag = { osm_ok: osm.ok, osm_failed: osm.fail, last_error: osm.lastError || lastError, wikidata_error: wikidataError };
   kept.failedKm = failed.map(([a, b]) => [cum[a], cum[b]]);
   kept.gaps = findGaps(kept, totalKm);
   kept.source = hasWd && hasOsm ? "OpenStreetMap + Wikidata" : hasWd ? "Wikidata" : "OpenStreetMap";
@@ -1045,6 +1072,8 @@ async function buildRoute(AIRPORTS, ExcelJS, params, progress = () => {}) {
     dest: { name: airportLabel(b), lat: b.lat, lng: lons[lons.length - 1] },
     path: mapPath, pois: outPois, candidate_count: pois.candidateCount || pois.length,
     skipped_segments: pois.skippedSegments || 0,
+    heavy_skipped: pois.heavySkipped || 0,
+    diag: pois.diag || {},
     failed_km: (pois.failedKm || []).map(([a, b]) => [+a.toFixed(1), +b.toFixed(1)]),
     gaps: (pois.gaps || []).map(([a, b]) => [+a.toFixed(1), +b.toFixed(1)]),
     gap_paths: (pois.gaps || []).map(([a, b]) => {
@@ -1136,7 +1165,9 @@ $("go").onclick = async () => {
     
     setMsg(`${res.origin.name} to ${res.dest.name}: ${Math.round(res.distance_km).toLocaleString()} km, ${res.pois.length} most relevant of ${res.candidate_count} POIs found` +
       (res.skipped_segments ? ` Could not load km ${res.failed_km.map(([a, b]) => Math.round(a) + "-" + Math.round(b)).join(", ")} (map servers busy): press Build route again to fill that part.` : "") +
+      (res.heavy_skipped ? " Lakes/forests/rivers etc. timed out for some stretches, so those types may be sparse there." : "") +
       (res.gaps.length ? ` No mapped POIs for km ${res.gaps.map(([a, b]) => Math.round(a) + "-" + Math.round(b)).join(", ")} (shown in orange; likely open sea or empty land).` : " Whole route covered.") +
+      (res.gaps.length || res.skipped_segments ? ` [map searches ok: ${res.diag.osm_ok}, failed: ${res.diag.osm_failed}${res.diag.last_error ? ", last error: " + res.diag.last_error : ""}${res.diag.wikidata_error ? ", wikidata: " + res.diag.wikidata_error : ""}]` : "") +
       (res.pois.length ? "" : " Try widening the corridor or selecting more POI types."));
     $("dl").style.display = "block";
     render(res);
