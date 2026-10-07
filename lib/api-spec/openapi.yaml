@@ -10,6 +10,10 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: overpass
+    description: Route and location data proxy
+  - name: wikidata
+    description: Wikidata POI fallback search
 paths:
   /healthz:
     get:
@@ -24,6 +28,68 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /overpass:
+    post:
+      operationId: queryOverpass
+      tags: [overpass]
+      summary: Query OpenStreetMap Overpass
+      description: Runs a validated Overpass query through resilient upstream mirrors.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OverpassRequest"
+      responses:
+        "200":
+          description: Overpass result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OverpassData"
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Overpass mirrors unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /wikidata-pois:
+    post:
+      operationId: queryWikidataPois
+      tags: [wikidata]
+      summary: Search Wikidata POIs along a route
+      description: Searches Wikidata around sampled route points for the requested POI categories.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WikidataPoiSearchInput"
+      responses:
+        "200":
+          description: Wikidata POI results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikidataPoisResponse"
+        "400":
+          description: Invalid route search
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Wikidata Query Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +99,133 @@ components:
           type: string
       required:
         - status
+    OverpassRequest:
+      type: object
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 20000
+      required:
+        - query
+    OverpassElement:
+      type: object
+      additionalProperties: true
+      properties:
+        type:
+          type: string
+        id:
+          type: integer
+        lat:
+          type: number
+        lon:
+          type: number
+        center:
+          type: object
+          additionalProperties: true
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+    OverpassData:
+      type: object
+      additionalProperties: true
+      properties:
+        elements:
+          type: array
+          items:
+            $ref: "#/components/schemas/OverpassElement"
+        remark:
+          type: string
+      required:
+        - elements
+    WikidataPoiSearchInput:
+      type: object
+      properties:
+        centers:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/GeoPoint"
+        radiusKm:
+          type: integer
+          minimum: 1
+          maximum: 100
+        categories:
+          type: array
+          minItems: 1
+          maxItems: 40
+          items:
+            type: string
+            minLength: 1
+            maxLength: 40
+      required:
+        - centers
+        - radiusKm
+        - categories
+    GeoPoint:
+      type: object
+      properties:
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          minimum: -180
+          maximum: 180
+      required:
+        - lat
+        - lon
+    WikidataPoiElement:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [wikidata]
+        id:
+          type: integer
+          minimum: 1
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          minimum: -180
+          maximum: 180
+        category:
+          type: string
+        wikidata:
+          type: string
+          pattern: "^Q[1-9][0-9]*$"
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+      required:
+        - type
+        - id
+        - lat
+        - lon
+        - category
+        - wikidata
+        - tags
+    WikidataPoisResponse:
+      type: object
+      properties:
+        elements:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikidataPoiElement"
+      required:
+        - elements
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
 
