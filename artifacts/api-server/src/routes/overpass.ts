@@ -22,17 +22,23 @@ const cache = new Map<string, { body: string; expiresAt: number }>();
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const router: IRouter = Router();
 
-function parseUsableResponse(body: string): boolean {
-  if (!body.trimStart().startsWith("{")) return false;
+type ResponseKind = "ok" | "heavy" | "bad";
+
+/**
+ * "heavy" = Overpass answered 200 but reported a runtime error (query timed out / out of memory).
+ * Another mirror will hit the same limit, so the caller should split the box rather than retry it.
+ */
+function classifyResponse(body: string): ResponseKind {
+  if (!body.trimStart().startsWith("{")) return "bad";
 
   try {
     const value = JSON.parse(body) as { remark?: unknown };
     if (typeof value.remark === "string" && /runtime error/i.test(value.remark)) {
-      return false;
+      return "heavy";
     }
-    return QueryOverpassResponse.safeParse(value).success;
+    return QueryOverpassResponse.safeParse(value).success ? "ok" : "bad";
   } catch {
-    return false;
+    return "bad";
   }
 }
 
@@ -63,6 +69,7 @@ router.post("/overpass", async (req, res): Promise<void> => {
 
   const startedAt = Date.now();
   let lastStatus = 502;
+  let heavyCount = 0;
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const remaining = DEADLINE_MS - (Date.now() - startedAt);
@@ -94,17 +101,27 @@ router.post("/overpass", async (req, res): Promise<void> => {
       }
       if (response.ok) {
         const body = await response.text().catch(() => "");
-        if (parseUsableResponse(body)) {
+        const kind = classifyResponse(body);
+        if (kind === "ok") {
           cacheResponse(cacheKey, body);
           res.setHeader("X-Cache", "MISS");
           res.type("application/json").send(body);
           return;
         }
-        lastStatus = 502;
+        if (kind === "heavy") {
+          heavyCount++;
+          lastStatus = 504;
+        } else {
+          lastStatus = 502;
+        }
       } else {
         lastStatus = response.status;
+        if (response.status === 504) heavyCount++;
       }
     }
+
+    // Two mirrors in a row saying "too heavy": stop and let the client split the area into smaller boxes.
+    if (heavyCount >= 2) break;
 
     if (attempt < MAX_ATTEMPTS - 1) {
       await sleep(lastStatus === 429 ? 2_000 : 750);
@@ -115,7 +132,7 @@ router.post("/overpass", async (req, res): Promise<void> => {
     { attempts: MAX_ATTEMPTS, upstreamStatus: lastStatus },
     "All Overpass upstreams failed",
   );
-  res.status(502).json({
+  res.status(heavyCount >= 2 ? 504 : 502).json({
     error: `Overpass data service is temporarily unavailable (upstream HTTP ${lastStatus})`,
   });
 });
